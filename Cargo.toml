@@ -91,3 +91,4 @@ serde = []
 
 [profile.release]
 debug = true
+lto = true # 在release模式下启用

@@ -137,7 +137,7 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        Self::new_with_config(None, Some("bookmarks.json"), true)
+        Self::new_with_config(Some("/Users/yunzou/Desktop/current_reading_book"), Some("bookmarks.json"), true)
     }
 
     /// Helper method to check if focus is on a main panel (not a popup)
