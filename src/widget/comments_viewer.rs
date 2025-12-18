@@ -1,20 +1,18 @@
-use crate::comments::{BookComments, Comment};
+use crate::comments::{BookComments, Comment, CommentTarget};
 use crate::inputs::KeySeq;
 use crate::main_app::VimNavMotions;
 use crate::markdown::Inline;
 use crate::search::{find_matches_in_text, SearchMode, SearchState, SearchablePanel};
 use crate::table_of_contents::TocItem;
-use crate::theme::OCEANIC_NEXT;
+use crate::theme::current_theme;
 use epub::doc::EpubDoc;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Stylize,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    },
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    Frame,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
@@ -24,7 +22,7 @@ use textwrap::wrap;
 pub enum CommentsViewerAction {
     JumpToComment {
         chapter_href: String,
-        paragraph_index: usize,
+        target: CommentTarget,
     },
     DeleteSelectedComment,
     Close,
@@ -70,9 +68,32 @@ pub struct CommentEntry {
     pub chapter_title: String,
     pub chapter_href: String,
     pub quoted_text: String,
-    pub comment: Comment,
+    pub comments: Vec<Comment>,
     pub render_start_line: usize,
     pub render_end_line: usize,
+}
+
+impl CommentEntry {
+    pub fn primary_comment(&self) -> &Comment {
+        self.comments
+            .first()
+            .expect("CommentEntry should contain at least one comment")
+    }
+
+    pub fn is_code_block(&self) -> bool {
+        matches!(
+            self.primary_comment().target,
+            CommentTarget::CodeBlock { .. }
+        )
+    }
+
+    pub fn comment_count(&self) -> usize {
+        self.comments.len()
+    }
+
+    pub fn comments(&self) -> &[Comment] {
+        &self.comments
+    }
 }
 
 impl CommentsViewer {
@@ -247,7 +268,8 @@ impl CommentsViewer {
             .map(|area| area.height as usize)
             .filter(|h| *h > 0)
             .unwrap_or(5);
-        let target = (self.selected_chapter_index + page).min(self.chapters.len().saturating_sub(1));
+        let target =
+            (self.selected_chapter_index + page).min(self.chapters.len().saturating_sub(1));
         self.select_chapter(target);
     }
 
@@ -279,11 +301,8 @@ impl CommentsViewer {
 
         for entry in self.rendered_entries.iter_mut() {
             let show_chapter_header = last_chapter_href.as_ref() != Some(&entry.chapter_href);
-            let entry_height = Self::calculate_entry_height_for_width(
-                entry,
-                content_width,
-                show_chapter_header,
-            );
+            let entry_height =
+                Self::calculate_entry_height_for_width(entry, content_width, show_chapter_header);
             entry.render_start_line = current_line;
             entry.render_end_line = current_line + entry_height;
             current_line = entry.render_end_line;
@@ -291,9 +310,7 @@ impl CommentsViewer {
         }
 
         self.total_rendered_lines = current_line;
-        let max_scroll = self
-            .total_rendered_lines
-            .saturating_sub(content_height);
+        let max_scroll = self.total_rendered_lines.saturating_sub(content_height);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
 
@@ -309,34 +326,52 @@ impl CommentsViewer {
             return Vec::new();
         }
 
-        let mut entries = Vec::new();
-        let mut current_line = 0;
+        let mut entries: Vec<CommentEntry> = Vec::new();
         let mut last_chapter_href: Option<String> = None;
+        let mut current_line = 0;
+        let mut code_group_map: HashMap<(String, usize), usize> = HashMap::new();
 
         for comment in all_comments {
             let chapter_title = Self::find_chapter_title(&comment.chapter_href, toc_items, epub);
             let quoted_text =
-                Self::extract_quoted_text(epub, &comment.chapter_href, comment.paragraph_index);
+                Self::extract_quoted_text(epub, &comment.chapter_href, comment.node_index());
 
-            let show_chapter_header = match &last_chapter_href {
-                Some(prev_href) => prev_href != &comment.chapter_href,
-                None => true,
+            let entry_index = if matches!(comment.target, CommentTarget::CodeBlock { .. }) {
+                let key = (comment.chapter_href.clone(), comment.node_index());
+                if let Some(&idx) = code_group_map.get(&key) {
+                    entries[idx].comments.push(comment.clone());
+                    continue;
+                } else {
+                    let idx = entries.len();
+                    code_group_map.insert(key, idx);
+                    idx
+                }
+            } else {
+                entries.len()
             };
-            let entry_height = Self::calculate_entry_height(show_chapter_header, &comment.content);
-            let render_start_line = current_line;
-            let render_end_line = current_line + entry_height;
 
-            entries.push(CommentEntry {
-                chapter_title,
-                chapter_href: comment.chapter_href.clone(),
-                quoted_text,
-                comment: comment.clone(),
-                render_start_line,
-                render_end_line,
-            });
+            if entry_index == entries.len() {
+                let show_chapter_header = match &last_chapter_href {
+                    Some(prev_href) => prev_href != &comment.chapter_href,
+                    None => true,
+                };
+                let render_start_line = current_line;
+                let estimated_height =
+                    Self::estimate_entry_height(show_chapter_header, 1, &comment.content);
+                let render_end_line = current_line + estimated_height;
 
-            current_line = render_end_line;
-            last_chapter_href = Some(comment.chapter_href.clone());
+                entries.push(CommentEntry {
+                    chapter_title,
+                    chapter_href: comment.chapter_href.clone(),
+                    quoted_text,
+                    comments: vec![comment.clone()],
+                    render_start_line,
+                    render_end_line,
+                });
+
+                current_line = render_end_line;
+                last_chapter_href = Some(comment.chapter_href.clone());
+            }
         }
 
         entries
@@ -346,7 +381,12 @@ impl CommentsViewer {
         let mut chapters = Vec::new();
         let mut href_to_index = HashMap::new();
         let mut seen_hrefs = HashSet::new();
-        Self::flatten_toc_items(toc_items, &mut chapters, &mut href_to_index, &mut seen_hrefs);
+        Self::flatten_toc_items(
+            toc_items,
+            &mut chapters,
+            &mut href_to_index,
+            &mut seen_hrefs,
+        );
 
         let mut unmatched_counts: HashMap<String, usize> = HashMap::new();
         for entry in entries {
@@ -355,7 +395,9 @@ impl CommentsViewer {
                     chapter.comment_count += 1;
                 }
             } else {
-                *unmatched_counts.entry(entry.chapter_href.clone()).or_default() += 1;
+                *unmatched_counts
+                    .entry(entry.chapter_href.clone())
+                    .or_default() += 1;
             }
         }
 
@@ -392,29 +434,18 @@ impl CommentsViewer {
         normalized.rsplit('/').next().unwrap_or(normalized)
     }
 
-    fn initial_chapter_index(
-        current_href: Option<&str>,
-        chapters: &[ChapterDisplay],
-    ) -> usize {
+    fn initial_chapter_index(current_href: Option<&str>, chapters: &[ChapterDisplay]) -> usize {
         if let Some(target) = current_href {
             let normalized_target = Self::normalize_href(target);
             if let Some(idx) = chapters.iter().position(|chapter| {
-                chapter
-                    .href
-                    .as_deref()
-                    .map(Self::normalize_href)
-                    == Some(normalized_target)
+                chapter.href.as_deref().map(Self::normalize_href) == Some(normalized_target)
             }) {
                 return idx;
             }
 
             let target_basename = Self::chapter_basename(target);
             if let Some(idx) = chapters.iter().position(|chapter| {
-                chapter
-                    .href
-                    .as_deref()
-                    .map(Self::chapter_basename)
-                    == Some(target_basename)
+                chapter.href.as_deref().map(Self::chapter_basename) == Some(target_basename)
             }) {
                 return idx;
             }
@@ -600,14 +631,18 @@ impl CommentsViewer {
         result
     }
 
-    fn calculate_entry_height(show_chapter_header: bool, comment_content: &str) -> usize {
+    fn estimate_entry_height(
+        show_chapter_header: bool,
+        comment_count: usize,
+        comment_content: &str,
+    ) -> usize {
         let mut height = 0;
         if show_chapter_header {
             height += 1; // Chapter title line
         }
-        height += 1; // Quoted text line
-        height += comment_content.lines().count(); // Content lines
-        height += 1; // Timestamp
+        height += comment_content.lines().count().max(1); // Quoted text
+        height += comment_count; // Headers/timestamps
+        height += comment_count * comment_content.lines().count().max(1); // Approximate content
         height += 1; // Empty separator line
         height
     }
@@ -626,19 +661,46 @@ impl CommentsViewer {
         height += Self::wrapped_line_count(&entry.quoted_text, quote_width);
 
         let comment_width = content_width.saturating_sub(2);
-        for line in entry.comment.content.lines() {
-            height += Self::wrapped_line_count(line, comment_width);
-        }
+        for (idx, comment) in entry.comments().iter().enumerate() {
+            let header_text = Self::comment_header_text(entry, idx, comment);
+            height += Self::wrapped_line_count(&header_text, comment_width);
 
-        let timestamp = entry
-            .comment
-            .updated_at
-            .format("%m-%d-%y %H:%M")
-            .to_string();
-        height += Self::wrapped_line_count(&timestamp, comment_width);
+            for line in comment.content.lines() {
+                height += Self::wrapped_line_count(line, comment_width);
+            }
+
+            if idx < entry.comment_count().saturating_sub(1) {
+                height += 1;
+            }
+        }
 
         height += 1; // Blank line separator
         height
+    }
+
+    fn comment_header_text(entry: &CommentEntry, idx: usize, comment: &Comment) -> String {
+        let timestamp = comment.updated_at.format("%m-%d-%y %H:%M").to_string();
+        let mut header = match comment.target {
+            CommentTarget::CodeBlock { line_range, .. } => {
+                if line_range.0 == line_range.1 {
+                    format!("Line {} // {}", line_range.0 + 1, timestamp)
+                } else {
+                    format!(
+                        "Lines {}-{} // {}",
+                        line_range.0 + 1,
+                        line_range.1 + 1,
+                        timestamp
+                    )
+                }
+            }
+            CommentTarget::Paragraph { .. } => format!("Note // {timestamp}"),
+        };
+
+        if entry.comment_count() > 1 {
+            header = format!("[{}] {header}", idx + 1);
+        }
+
+        header
     }
 
     fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -689,7 +751,7 @@ impl CommentsViewer {
 
         let chapter_block = Block::default()
             .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(OCEANIC_NEXT.base_02));
+            .border_style(Style::default().fg(current_theme().base_02));
         let chapter_inner = chapter_block.inner(columns[0]);
         self.last_chapter_area = Some(chapter_inner);
         f.render_widget(chapter_block, columns[0]);
@@ -734,41 +796,41 @@ impl CommentsViewer {
                     Span::styled(
                         search_text,
                         Style::default()
-                            .fg(OCEANIC_NEXT.base_0a)
+                            .fg(current_theme().base_0a)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(OCEANIC_NEXT.base_0d))
-                .style(Style::default().bg(OCEANIC_NEXT.base_00))
+                .border_style(Style::default().fg(current_theme().base_0d))
+                .style(Style::default().bg(current_theme().base_00))
         } else {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(OCEANIC_NEXT.base_0d))
-                .style(Style::default().bg(OCEANIC_NEXT.base_00))
+                .border_style(Style::default().fg(current_theme().base_0d))
+                .style(Style::default().bg(current_theme().base_00))
         }
     }
 
     fn render_chapter_list(&mut self, f: &mut Frame, area: Rect) {
         if self.global_search_mode {
             let total = self.all_entries.len();
-            let mut style = Style::default().fg(OCEANIC_NEXT.base_05);
+            let mut style = Style::default().fg(current_theme().base_05);
             let mut count_style = Style::default()
-                .fg(OCEANIC_NEXT.base_0e)
+                .fg(current_theme().base_0e)
                 .add_modifier(Modifier::BOLD);
-            let mut background = Style::default().bg(OCEANIC_NEXT.base_00);
+            let mut background = Style::default().bg(current_theme().base_00);
 
             if self.focus == ViewerFocus::Chapters {
                 style = Style::default()
-                    .fg(OCEANIC_NEXT.base_00)
-                    .bg(OCEANIC_NEXT.base_02)
+                    .fg(current_theme().base_00)
+                    .bg(current_theme().base_02)
                     .add_modifier(Modifier::BOLD);
                 count_style = Style::default()
-                    .fg(OCEANIC_NEXT.base_00)
-                    .bg(OCEANIC_NEXT.base_02)
+                    .fg(current_theme().base_00)
+                    .bg(current_theme().base_02)
                     .add_modifier(Modifier::BOLD);
-                background = Style::default().bg(OCEANIC_NEXT.base_02);
+                background = Style::default().bg(current_theme().base_02);
             }
 
             let line = Line::from(vec![
@@ -776,9 +838,10 @@ impl CommentsViewer {
                 Span::raw(" "),
                 Span::styled("Comments Search", style),
             ])
-            .bg(background.bg.unwrap_or(OCEANIC_NEXT.base_00));
+            .bg(background.bg.unwrap_or(current_theme().base_00));
 
-            let paragraph = Paragraph::new(vec![line]).style(Style::default().bg(OCEANIC_NEXT.base_00));
+            let paragraph =
+                Paragraph::new(vec![line]).style(Style::default().bg(current_theme().base_00));
             f.render_widget(paragraph, area);
             return;
         }
@@ -794,11 +857,8 @@ impl CommentsViewer {
 
         if self.selected_chapter_index < self.chapter_scroll_offset {
             self.chapter_scroll_offset = self.selected_chapter_index;
-        } else if self.selected_chapter_index
-            >= self.chapter_scroll_offset + visible_height
-        {
-            self.chapter_scroll_offset =
-                self.selected_chapter_index + 1 - visible_height;
+        } else if self.selected_chapter_index >= self.chapter_scroll_offset + visible_height {
+            self.chapter_scroll_offset = self.selected_chapter_index + 1 - visible_height;
         }
 
         let max_title_width = area.width.saturating_sub(4) as usize;
@@ -812,47 +872,43 @@ impl CommentsViewer {
             .take(visible_height)
         {
             let is_selected = idx == self.selected_chapter_index;
-            let mut title = format!(
-                "{}{}",
-                "  ".repeat(chapter.depth.min(4)),
-                chapter.title
-            );
+            let mut title = format!("{}{}", "  ".repeat(chapter.depth.min(4)), chapter.title);
             if title.len() > max_title_width {
                 title = Self::truncate_with_ellipsis(&title, max_title_width);
             }
 
             let base_style = if chapter.comment_count == 0 {
-                Style::default().fg(OCEANIC_NEXT.base_03)
+                Style::default().fg(current_theme().base_03)
             } else {
-                Style::default().fg(OCEANIC_NEXT.base_05)
+                Style::default().fg(current_theme().base_05)
             };
 
             let mut title_style = base_style;
             let mut count_style = if chapter.comment_count == 0 {
-                Style::default().fg(OCEANIC_NEXT.base_03)
+                Style::default().fg(current_theme().base_03)
             } else {
                 Style::default()
-                    .fg(OCEANIC_NEXT.base_0e)
+                    .fg(current_theme().base_0e)
                     .add_modifier(Modifier::BOLD)
             };
-            let mut background_style = Style::default().bg(OCEANIC_NEXT.base_00);
+            let mut background_style = Style::default().bg(current_theme().base_00);
             if self.focus == ViewerFocus::Chapters {
                 if is_selected {
                     title_style = Style::default()
-                        .fg(OCEANIC_NEXT.base_00)
-                        .bg(OCEANIC_NEXT.base_02)
+                        .fg(current_theme().base_00)
+                        .bg(current_theme().base_02)
                         .add_modifier(Modifier::BOLD);
                     count_style = count_style
-                        .fg(OCEANIC_NEXT.base_00)
-                        .bg(OCEANIC_NEXT.base_02);
-                    background_style = Style::default().bg(OCEANIC_NEXT.base_02);
+                        .fg(current_theme().base_00)
+                        .bg(current_theme().base_02);
+                    background_style = Style::default().bg(current_theme().base_02);
                 }
             } else if is_selected {
                 title_style = Style::default()
-                    .fg(OCEANIC_NEXT.base_08)
+                    .fg(current_theme().base_08)
                     .add_modifier(Modifier::BOLD);
                 count_style = Style::default()
-                    .fg(OCEANIC_NEXT.base_0d)
+                    .fg(current_theme().base_0d)
                     .add_modifier(Modifier::BOLD);
             };
             let count_text = if chapter.comment_count == 0 {
@@ -867,11 +923,11 @@ impl CommentsViewer {
                     Span::raw(" "),
                     Span::styled(title, title_style),
                 ])
-                .bg(background_style.bg.unwrap_or(OCEANIC_NEXT.base_00)),
+                .bg(background_style.bg.unwrap_or(current_theme().base_00)),
             );
         }
 
-        let paragraph = Paragraph::new(lines).style(Style::default().bg(OCEANIC_NEXT.base_00));
+        let paragraph = Paragraph::new(lines).style(Style::default().bg(current_theme().base_00));
         f.render_widget(paragraph, area);
     }
 
@@ -888,8 +944,16 @@ impl CommentsViewer {
         let mut lines = Vec::new();
         for (idx, entry) in self.rendered_entries.iter().enumerate() {
             let is_selected = self.selected_index == idx;
-            let show_header = idx == 0;
-            self.render_entry(entry, is_selected, idx, show_header, content_width, &mut lines);
+            let show_header =
+                idx == 0 || self.rendered_entries[idx - 1].chapter_href != entry.chapter_href;
+            self.render_entry(
+                entry,
+                is_selected,
+                idx,
+                show_header,
+                content_width,
+                &mut lines,
+            );
         }
 
         let paragraph = Paragraph::new(lines).scroll((self.scroll_offset as u16, 0));
@@ -897,7 +961,7 @@ impl CommentsViewer {
 
         if self.total_rendered_lines > content_height {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(Style::default().fg(OCEANIC_NEXT.base_03));
+                .style(Style::default().fg(current_theme().base_03));
             let mut scrollbar_state =
                 ScrollbarState::new(self.total_rendered_lines).position(self.scroll_offset);
             f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
@@ -954,13 +1018,13 @@ impl CommentsViewer {
             Line::from(Span::styled(
                 "No comments in this chapter",
                 Style::default()
-                    .fg(OCEANIC_NEXT.base_03)
+                    .fg(current_theme().base_03)
                     .add_modifier(Modifier::ITALIC),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "Select text and press 'a' to add a note",
-                Style::default().fg(OCEANIC_NEXT.base_04),
+                Style::default().fg(current_theme().base_04),
             )),
         ])
         .alignment(ratatui::layout::Alignment::Center);
@@ -978,29 +1042,29 @@ impl CommentsViewer {
         lines: &mut Vec<Line<'static>>,
     ) {
         let chapter_style = Style::default()
-            .fg(OCEANIC_NEXT.base_0c)
+            .fg(current_theme().base_0c)
             .add_modifier(Modifier::BOLD);
 
         let quote_style = if is_selected {
             Style::default()
-                .fg(OCEANIC_NEXT.base_04)
+                .fg(current_theme().base_04)
                 .add_modifier(Modifier::ITALIC)
-                .bg(OCEANIC_NEXT.base_01)
+                .bg(current_theme().base_01)
         } else {
             Style::default()
-                .fg(OCEANIC_NEXT.base_03)
+                .fg(current_theme().base_03)
                 .add_modifier(Modifier::ITALIC)
         };
 
         let comment_style = if is_selected {
             Style::default()
-                .fg(OCEANIC_NEXT.base_05)
-                .bg(OCEANIC_NEXT.base_01)
+                .fg(current_theme().base_05)
+                .bg(current_theme().base_01)
         } else {
-            Style::default().fg(OCEANIC_NEXT.base_05)
+            Style::default().fg(current_theme().base_05)
         };
 
-        let timestamp_style = Style::default().fg(OCEANIC_NEXT.base_03);
+        let timestamp_style = Style::default().fg(current_theme().base_03);
 
         // Chapter title - only show if this is a new chapter
         if show_chapter_header {
@@ -1033,31 +1097,32 @@ impl CommentsViewer {
         // Comment content - handle multiline comments with wrapping
         let comment_prefix = "  ";
         let comment_width = content_width.saturating_sub(comment_prefix.len());
-        for content_line in entry.comment.content.lines() {
-            for wrapped in Self::wrap_text(content_line, comment_width) {
-                let mut spans = vec![Span::raw(comment_prefix)];
-                let highlighted = if self.search_state.active
-                    && self.search_state.is_match(entry_index)
-                {
-                    self.create_highlighted_text(&wrapped, entry_index, comment_style)
-                } else {
-                    vec![Span::styled(wrapped, comment_style)]
-                };
-                spans.extend(highlighted);
-                lines.push(Line::from(spans));
+        for (comment_idx, comment) in entry.comments().iter().enumerate() {
+            let header_text = Self::comment_header_text(entry, comment_idx, comment);
+            for wrapped in Self::wrap_text(&header_text, comment_width) {
+                lines.push(Line::from(vec![
+                    Span::raw(comment_prefix),
+                    Span::styled(wrapped, timestamp_style),
+                ]));
             }
-        }
 
-        let timestamp = entry
-            .comment
-            .updated_at
-            .format("%m-%d-%y %H:%M")
-            .to_string();
-        for wrapped in Self::wrap_text(&timestamp, comment_width) {
-            lines.push(Line::from(vec![
-                Span::raw(comment_prefix),
-                Span::styled(wrapped, timestamp_style),
-            ]));
+            for content_line in comment.content.lines() {
+                for wrapped in Self::wrap_text(content_line, comment_width) {
+                    let mut spans = vec![Span::raw(comment_prefix)];
+                    let highlighted =
+                        if self.search_state.active && self.search_state.is_match(entry_index) {
+                            self.create_highlighted_text(&wrapped, entry_index, comment_style)
+                        } else {
+                            vec![Span::styled(wrapped, comment_style)]
+                        };
+                    spans.extend(highlighted);
+                    lines.push(Line::from(spans));
+                }
+            }
+
+            if comment_idx < entry.comment_count().saturating_sub(1) {
+                lines.push(Line::from(""));
+            }
         }
 
         lines.push(Line::from(""));
@@ -1110,7 +1175,7 @@ impl CommentsViewer {
                 // Other matches: dim yellow background
                 Style::default()
                     .bg(Color::Rgb(100, 100, 0))
-                    .fg(base_style.fg.unwrap_or(OCEANIC_NEXT.base_05))
+                    .fg(base_style.fg.unwrap_or(current_theme().base_05))
             };
 
             let end_pos = actual_pos + self.search_state.query.len();
@@ -1145,8 +1210,7 @@ impl CommentsViewer {
             {
                 self.focus = ViewerFocus::Chapters;
                 let relative_y = y.saturating_sub(chapter_area.y);
-                let target_index =
-                    self.chapter_scroll_offset + relative_y as usize;
+                let target_index = self.chapter_scroll_offset + relative_y as usize;
                 if !self.global_search_mode && target_index < self.chapters.len() {
                     self.select_chapter(target_index);
                 }
@@ -1193,17 +1257,16 @@ impl CommentsViewer {
         self.rendered_entries.get(self.selected_index)
     }
 
-    pub fn remove_selected_comment(&mut self) {
+    pub fn remove_selected_comment(&mut self) -> Vec<Comment> {
         if self.rendered_entries.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let removed = self.rendered_entries.remove(self.selected_index);
-        if let Some(idx) = self
-            .all_entries
-            .iter()
-            .position(|entry| entry.comment == removed.comment)
-        {
+        let removed_comments = removed.comments.clone();
+        if let Some(idx) = self.all_entries.iter().position(|entry| {
+            entry.chapter_href == removed.chapter_href && entry.comments == removed_comments
+        }) {
             self.all_entries.remove(idx);
         }
 
@@ -1228,6 +1291,8 @@ impl CommentsViewer {
                 .map(|entry| entry.render_end_line)
                 .unwrap_or(0),
         );
+
+        removed_comments
     }
 
     fn collect_searchable_content(&self) -> Vec<String> {
@@ -1236,7 +1301,14 @@ impl CommentsViewer {
             .map(|entry| {
                 format!(
                     "{} {} {}",
-                    entry.chapter_title, entry.quoted_text, entry.comment.content
+                    entry.chapter_title,
+                    entry.quoted_text,
+                    entry
+                        .comments
+                        .iter()
+                        .map(|c| c.content.clone())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 )
             })
             .collect()
@@ -1572,7 +1644,7 @@ impl CommentsViewer {
                     self.selected_comment()
                         .map(|entry| CommentsViewerAction::JumpToComment {
                             chapter_href: entry.chapter_href.clone(),
-                            paragraph_index: entry.comment.paragraph_index,
+                            target: entry.primary_comment().target.clone(),
                         })
                 }
                 _ => None,

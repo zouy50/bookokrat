@@ -17,11 +17,13 @@ use crate::parsing::toc_parser::TocParser;
 use crate::reading_history::ReadingHistory;
 use crate::search::{SearchMode, SearchablePanel};
 use crate::search_engine::SearchEngine;
+use crate::settings;
 use crate::system_command::{RealSystemCommandExecutor, SystemCommandExecutor};
 use crate::table_of_contents::TocItem;
-use crate::theme::OCEANIC_NEXT;
+use crate::theme::{current_theme, current_theme_name};
 use crate::types::LinkInfo;
 use crate::widget::help_popup::{HelpPopup, HelpPopupAction};
+use crate::widget::theme_selector::{ThemeSelector, ThemeSelectorAction};
 use image::GenericImageView;
 use log::warn;
 
@@ -92,8 +94,10 @@ pub struct App {
     book_search: Option<BookSearch>,
     help_popup: Option<HelpPopup>,
     comments_viewer: Option<crate::widget::comments_viewer::CommentsViewer>,
+    theme_selector: Option<ThemeSelector>,
     notifications: NotificationManager,
     help_bar_area: Rect,
+    zen_mode: bool,
 }
 
 pub trait VimNavMotions {
@@ -127,6 +131,7 @@ pub enum PopupWindow {
     BookSearch,
     Help,
     CommentsViewer,
+    ThemeSelector,
 }
 
 impl Default for App {
@@ -280,7 +285,8 @@ impl App {
         };
 
         let navigation_panel = NavigationPanel::new(&book_manager);
-        let text_reader = MarkdownTextReader::new();
+        let mut text_reader = MarkdownTextReader::new();
+        text_reader.set_margin(settings::get_margin());
         let bookmarks = Bookmarks::load_or_ephemeral(bookmark_file);
 
         let image_storage = Arc::new(ImageStorage::new_in_project_temp().unwrap_or_else(|e| {
@@ -320,8 +326,10 @@ impl App {
             book_search: None,
             help_popup: None,
             comments_viewer: None,
+            theme_selector: None,
             notifications: NotificationManager::new(),
             help_bar_area: Rect::default(),
+            zen_mode: false,
         };
 
         if auto_load_recent
@@ -975,14 +983,14 @@ impl App {
                                 if viewer.handle_mouse_click(mouse_event.column, mouse_event.row) {
                                     if let Some(entry) = viewer.selected_comment() {
                                         let chapter_href = entry.chapter_href.clone();
-                                        let paragraph_index = entry.comment.paragraph_index;
+                                        let node_index = entry.primary_comment().node_index();
                                         viewer.save_position();
                                         self.comments_viewer = None;
                                         self.close_popup_to_previous();
                                         self.set_main_panel_focus(MainPanel::Content);
 
                                         // Ensure the reader restores to the correct node after navigation
-                                        self.text_reader.restore_to_node_index(paragraph_index);
+                                        self.text_reader.restore_to_node_index(node_index);
 
                                         if let Err(e) =
                                             self.navigate_to_chapter_by_href(&chapter_href)
@@ -993,6 +1001,63 @@ impl App {
                                             self.show_error(format!(
                                                 "Failed to navigate to comment: {e}"
                                             ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if matches!(
+                    self.focused_panel,
+                    FocusedPanel::Popup(PopupWindow::ThemeSelector)
+                ) {
+                    let click_x = mouse_event.column;
+                    let click_y = mouse_event.row;
+
+                    if let Some(ref mut selector) = self.theme_selector {
+                        // Check if click is outside popup area - close it
+                        if selector.is_outside_popup_area(click_x, click_y) {
+                            self.theme_selector = None;
+                            self.close_popup_to_previous();
+                            return;
+                        }
+
+                        let click_type = self
+                            .mouse_tracker
+                            .detect_click_type(mouse_event.column, mouse_event.row);
+
+                        match click_type {
+                            ClickType::Single | ClickType::Triple => {
+                                selector.handle_mouse_click(mouse_event.column, mouse_event.row);
+                            }
+                            ClickType::Double => {
+                                if selector.handle_mouse_click(mouse_event.column, mouse_event.row)
+                                {
+                                    // Apply theme on double-click
+                                    if let Some(action) = selector.handle_key(
+                                        crossterm::event::KeyEvent::new(
+                                            crossterm::event::KeyCode::Enter,
+                                            crossterm::event::KeyModifiers::NONE,
+                                        ),
+                                        &mut self.key_sequence,
+                                    ) {
+                                        match action {
+                                            ThemeSelectorAction::ThemeChanged => {
+                                                self.text_reader.invalidate_render_cache();
+                                                self.show_info(&format!(
+                                                    "Theme: {}",
+                                                    current_theme_name()
+                                                ));
+                                                self.theme_selector = None;
+                                                self.close_popup_to_previous();
+                                            }
+                                            ThemeSelectorAction::Close => {
+                                                self.theme_selector = None;
+                                                self.close_popup_to_previous();
+                                            }
                                         }
                                     }
                                 }
@@ -1555,12 +1620,19 @@ impl App {
 
     /// Calculate the navigation panel width based on stored terminal width
     fn nav_panel_width(&self) -> u16 {
-        // 30% of terminal width, minimum 20 columns
-        ((self.terminal_size.width * 30) / 100).max(20)
+        if self.zen_mode {
+            0
+        } else {
+            // 30% of terminal width, minimum 20 columns
+            ((self.terminal_size.width * 30) / 100).max(20)
+        }
     }
 
     /// Get the navigation panel area based on current terminal size
     fn get_navigation_panel_area(&self) -> Rect {
+        if self.zen_mode {
+            return Rect::default(); // No navigation panel in zen mode
+        }
         use ratatui::layout::{Constraint, Direction, Layout};
         // Calculate the same layout as in render
         let chunks = Layout::default()
@@ -1659,42 +1731,60 @@ impl App {
 
         self.terminal_size = f.area();
 
-        let background_block = Block::default().style(Style::default().bg(OCEANIC_NEXT.base_00));
+        let background_block = Block::default().style(Style::default().bg(current_theme().base_00));
         f.render_widget(background_block, f.area());
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
-            .split(f.area());
-
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(chunks[0]);
-
-        self.navigation_panel.render(
-            f,
-            main_chunks[0],
-            self.is_main_panel(MainPanel::NavigationList),
-            &OCEANIC_NEXT,
-            &self.book_manager,
-        );
-
-        if let Some(ref book) = self.current_book {
-            self.text_reader.render(
-                f,
-                main_chunks[1],
-                book.current_chapter(),
-                book.total_chapters(),
-                &OCEANIC_NEXT,
-                self.is_main_panel(MainPanel::Content),
-            );
+        if self.zen_mode {
+            // Zen mode: full screen content, no navigation panel or help bar
+            if let Some(ref book) = self.current_book {
+                self.text_reader.render(
+                    f,
+                    f.area(),
+                    book.current_chapter(),
+                    book.total_chapters(),
+                    &current_theme(),
+                    true, // always focused in zen mode
+                );
+            } else {
+                self.render_default_content(f, f.area(), "Select a file to view its content");
+            }
+            // Don't set help_bar_area in zen mode - it's hidden
         } else {
-            self.render_default_content(f, main_chunks[1], "Select a file to view its content");
-        }
+            // Normal mode: existing layout
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(3)])
+                .split(f.area());
 
-        self.render_help_bar(f, chunks[1], fps_counter);
-        self.help_bar_area = chunks[1];
+            let main_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(chunks[0]);
+
+            self.navigation_panel.render(
+                f,
+                main_chunks[0],
+                self.is_main_panel(MainPanel::NavigationList),
+                &current_theme(),
+                &self.book_manager,
+            );
+
+            if let Some(ref book) = self.current_book {
+                self.text_reader.render(
+                    f,
+                    main_chunks[1],
+                    book.current_chapter(),
+                    book.total_chapters(),
+                    &current_theme(),
+                    self.is_main_panel(MainPanel::Content),
+                );
+            } else {
+                self.render_default_content(f, main_chunks[1], "Select a file to view its content");
+            }
+
+            self.render_help_bar(f, chunks[1], fps_counter);
+            self.help_bar_area = chunks[1];
+        }
 
         if matches!(
             self.focused_panel,
@@ -1736,7 +1826,7 @@ impl App {
             f.render_widget(dim_block, f.area());
 
             if let Some(ref mut book_search) = self.book_search {
-                book_search.render(f, f.area(), &OCEANIC_NEXT);
+                book_search.render(f, f.area(), &current_theme());
             }
         }
 
@@ -1782,22 +1872,38 @@ impl App {
                 comments_viewer.render(f, f.area());
             }
         }
+
+        if matches!(
+            self.focused_panel,
+            FocusedPanel::Popup(PopupWindow::ThemeSelector)
+        ) {
+            let dim_block = Block::default().style(
+                Style::default()
+                    .bg(Color::Rgb(10, 10, 10))
+                    .add_modifier(Modifier::DIM),
+            );
+            f.render_widget(dim_block, f.area());
+
+            if let Some(ref mut theme_selector) = self.theme_selector {
+                theme_selector.render(f, f.area());
+            }
+        }
     }
 
     fn render_default_content(&self, f: &mut ratatui::Frame, area: Rect, content: &str) {
         // Use focus-aware colors instead of hardcoded false
         let (text_color, border_color, _bg_color) =
-            OCEANIC_NEXT.get_panel_colors(self.is_main_panel(MainPanel::Content));
+            current_theme().get_panel_colors(self.is_main_panel(MainPanel::Content));
 
         let content_border = Block::default()
             .borders(Borders::ALL)
             .title("Content")
             .border_style(Style::default().fg(border_color))
-            .style(Style::default().bg(OCEANIC_NEXT.base_00));
+            .style(Style::default().bg(current_theme().base_00));
 
         let paragraph = Paragraph::new(content)
             .block(content_border)
-            .style(Style::default().fg(text_color).bg(OCEANIC_NEXT.base_00));
+            .style(Style::default().fg(text_color).bg(current_theme().base_00));
 
         f.render_widget(paragraph, area);
     }
@@ -1822,10 +1928,14 @@ impl App {
         let comments_full = "[Space+a: Comments] ";
         let history_full = "[Space+h: History] ";
         let stats_full = "[Space+d: Stats] ";
+        let theme_full = "[Space+t: Theme] ";
         let help_full = "[?: Help]";
 
-        let total_len =
-            (comments_full.len() + history_full.len() + stats_full.len() + help_full.len()) as u16;
+        let total_len = (comments_full.len()
+            + history_full.len()
+            + stats_full.len()
+            + theme_full.len()
+            + help_full.len()) as u16;
         let section_start = width.saturating_sub(total_len);
 
         let comments_start = section_start + "[".len() as u16;
@@ -1837,10 +1947,17 @@ impl App {
             + history_full.len() as u16
             + "[".len() as u16;
         let stats_end = stats_start + "Space+d: Stats".len() as u16;
+        let theme_start = section_start
+            + comments_full.len() as u16
+            + history_full.len() as u16
+            + stats_full.len() as u16
+            + "[".len() as u16;
+        let theme_end = theme_start + "Space+t: Theme".len() as u16;
         let help_start = section_start
             + comments_full.len() as u16
             + history_full.len() as u16
             + stats_full.len() as u16
+            + theme_full.len() as u16
             + "[".len() as u16;
         let help_end = help_start + "?: Help".len() as u16;
 
@@ -1896,6 +2013,15 @@ impl App {
             return true;
         }
 
+        if inner_x >= theme_start && inner_x < theme_end {
+            if let FocusedPanel::Main(panel) = self.focused_panel {
+                self.previous_main_panel = panel;
+            }
+            self.theme_selector = Some(ThemeSelector::new());
+            self.focused_panel = FocusedPanel::Popup(PopupWindow::ThemeSelector);
+            return true;
+        }
+
         if inner_x >= help_start && inner_x < help_end {
             if let FocusedPanel::Main(panel) = self.focused_panel {
                 self.previous_main_panel = panel;
@@ -1910,7 +2036,7 @@ impl App {
 
     fn render_help_bar(&self, f: &mut ratatui::Frame, area: Rect, fps_counter: &FPSCounter) {
         use crate::notification::NotificationLevel;
-        let (_, _, border_color, _, _) = OCEANIC_NEXT.get_interface_colors(false);
+        let (_, _, border_color, _, _) = current_theme().get_interface_colors(false);
 
         let help_content = if let Some(notification) = self.notifications.get_current() {
             let level_str = match notification.level {
@@ -1970,6 +2096,9 @@ impl App {
                 FocusedPanel::Popup(PopupWindow::CommentsViewer) => {
                     "j/k/Ctrl+d/u: Scroll | /: Search | Enter/DblClick: Jump | ESC: Close"
                 }
+                FocusedPanel::Popup(PopupWindow::ThemeSelector) => {
+                    "j/k: Navigate | Enter: Apply | ESC: Close"
+                }
             };
             help_text.to_string()
         };
@@ -1977,7 +2106,7 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
-            .style(Style::default().bg(OCEANIC_NEXT.base_00));
+            .style(Style::default().bg(current_theme().base_00));
 
         let inner_area = block.inner(area);
         f.render_widget(block, area);
@@ -1989,12 +2118,12 @@ impl App {
         };
         let left_para = Paragraph::new(left_content).style(
             Style::default()
-                .fg(OCEANIC_NEXT.base_03)
-                .bg(OCEANIC_NEXT.base_00),
+                .fg(current_theme().base_03)
+                .bg(current_theme().base_00),
         );
         f.render_widget(left_para, inner_area);
 
-        let text_color = OCEANIC_NEXT.base_03;
+        let text_color = current_theme().base_03;
         let right_content = Line::from(vec![
             Span::raw("["),
             Span::styled(
@@ -2022,6 +2151,14 @@ impl App {
             Span::raw("] "),
             Span::raw("["),
             Span::styled(
+                "Space+t: Theme",
+                Style::default()
+                    .fg(text_color)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::raw("] "),
+            Span::raw("["),
+            Span::styled(
                 "?: Help",
                 Style::default()
                     .fg(text_color)
@@ -2032,7 +2169,7 @@ impl App {
 
         let right_para = Paragraph::new(right_content)
             .alignment(Alignment::Right)
-            .style(Style::default().bg(OCEANIC_NEXT.base_00));
+            .style(Style::default().bg(current_theme().base_00));
         f.render_widget(right_para, inner_area);
     }
 
@@ -2218,6 +2355,26 @@ impl App {
                 self.key_sequence.clear();
                 true
             }
+            " t" => {
+                // Handle Space->t to toggle theme selector (global)
+                if matches!(
+                    self.focused_panel,
+                    FocusedPanel::Popup(PopupWindow::ThemeSelector)
+                ) {
+                    // Close theme selector - return to previous panel
+                    self.close_popup_to_previous();
+                    self.theme_selector = None;
+                } else {
+                    // Open theme selector - save current main panel
+                    if let FocusedPanel::Main(panel) = self.focused_panel {
+                        self.previous_main_panel = panel;
+                    }
+                    self.theme_selector = Some(ThemeSelector::new());
+                    self.focused_panel = FocusedPanel::Popup(PopupWindow::ThemeSelector);
+                }
+                self.key_sequence.clear();
+                true
+            }
             _ if sequence.len() >= 2 => {
                 // Unknown sequence of 2+ chars, reset
                 self.key_sequence.clear();
@@ -2370,7 +2527,7 @@ impl App {
                     }
                     CommentsViewerAction::JumpToComment {
                         chapter_href,
-                        paragraph_index,
+                        target,
                     } => {
                         if let Some(ref mut viewer) = self.comments_viewer {
                             viewer.save_position();
@@ -2379,7 +2536,7 @@ impl App {
                         self.set_main_panel_focus(MainPanel::Content);
 
                         // Set pending node restore before navigating
-                        self.text_reader.restore_to_node_index(paragraph_index);
+                        self.text_reader.restore_to_node_index(target.node_index());
 
                         if let Err(e) = self.navigate_to_chapter_by_href(&chapter_href) {
                             error!("Failed to navigate to chapter {chapter_href}: {e}");
@@ -2387,21 +2544,26 @@ impl App {
                         }
                     }
                     CommentsViewerAction::DeleteSelectedComment => {
-                        if let Some(entry) =
-                            self.comments_viewer.as_ref().and_then(|v| v.selected_comment().cloned())
+                        if let Some(entry) = self
+                            .comments_viewer
+                            .as_ref()
+                            .and_then(|v| v.selected_comment().cloned())
                         {
                             let mut delete_success = false;
                             let comments = self.text_reader.get_comments();
                             match comments.lock() {
                                 Ok(mut guard) => {
-                                    if let Err(e) = guard.delete_comment(
-                                        &entry.chapter_href,
-                                        entry.comment.paragraph_index,
-                                        entry.comment.word_range,
-                                    ) {
-                                        error!("Failed to delete comment: {e}");
-                                        self.show_error(format!("Failed to delete comment: {e}"));
-                                    } else {
+                                    for comment in &entry.comments {
+                                        if let Err(e) = guard
+                                            .delete_comment(&entry.chapter_href, &comment.target)
+                                        {
+                                            error!("Failed to delete comment: {e}");
+                                            self.show_error(format!(
+                                                "Failed to delete comment: {e}"
+                                            ));
+                                            delete_success = false;
+                                            break;
+                                        }
                                         delete_success = true;
                                     }
                                 }
@@ -2412,17 +2574,48 @@ impl App {
                             }
 
                             if delete_success {
-                                self.text_reader.delete_comment_by_location(
-                                    &entry.chapter_href,
-                                    entry.comment.paragraph_index,
-                                    entry.comment.word_range,
-                                );
+                                for comment in &entry.comments {
+                                    self.text_reader.delete_comment_by_location(
+                                        &entry.chapter_href,
+                                        &comment.target,
+                                    );
+                                }
                                 if let Some(ref mut viewer) = self.comments_viewer {
                                     viewer.remove_selected_comment();
                                 }
-                                self.show_info("Comment deleted");
+                                let msg = if entry.comments.len() > 1 {
+                                    "Comments deleted"
+                                } else {
+                                    "Comment deleted"
+                                };
+                                self.show_info(msg);
                             }
                         }
+                    }
+                }
+            }
+            return None;
+        }
+
+        // If theme selector popup is shown, handle keys for it
+        if self.focused_panel == FocusedPanel::Popup(PopupWindow::ThemeSelector) {
+            let action = if let Some(ref mut selector) = self.theme_selector {
+                selector.handle_key(key, &mut self.key_sequence)
+            } else {
+                None
+            };
+
+            if let Some(action) = action {
+                match action {
+                    ThemeSelectorAction::Close => {
+                        self.close_popup_to_previous();
+                        self.theme_selector = None;
+                    }
+                    ThemeSelectorAction::ThemeChanged => {
+                        self.text_reader.invalidate_render_cache();
+                        self.show_info(&format!("Theme: {}", current_theme_name()));
+                        self.close_popup_to_previous();
+                        self.theme_selector = None;
                     }
                 }
             }
@@ -2619,6 +2812,20 @@ impl App {
                     self.scroll_half_screen_up(visible_height);
                 }
             }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Save current content position before toggling zen mode
+                let current_node = self.text_reader.get_current_node_index();
+                self.zen_mode = !self.zen_mode;
+                // Restore position after width change causes re-render
+                self.text_reader.restore_to_node_index(current_node);
+                // When entering zen mode while on NavigationList, switch to Content
+                if self.zen_mode
+                    && self.is_main_panel(MainPanel::NavigationList)
+                    && self.current_book.is_some()
+                {
+                    self.set_main_panel_focus(MainPanel::Content);
+                }
+            }
 
             KeyCode::Char('G') => {
                 if self.current_book.is_some() {
@@ -2640,6 +2847,9 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('t') => {
+                self.handle_key_sequence('t');
+            }
             KeyCode::Char('?') => {
                 self.help_popup = Some(HelpPopup::new());
                 self.focused_panel = FocusedPanel::Popup(PopupWindow::Help);
@@ -2656,6 +2866,18 @@ impl App {
                 } else if self.is_in_search_mode() {
                     self.cancel_current_search();
                 }
+            }
+            KeyCode::Char('=') | KeyCode::Char('+') => {
+                let current_node = self.text_reader.get_current_node_index();
+                self.text_reader.increase_margin();
+                self.text_reader.restore_to_node_index(current_node);
+                settings::set_margin(self.text_reader.get_margin());
+            }
+            KeyCode::Char('-') => {
+                let current_node = self.text_reader.get_current_node_index();
+                self.text_reader.decrease_margin();
+                self.text_reader.restore_to_node_index(current_node);
+                settings::set_margin(self.text_reader.get_margin());
             }
             _ => {}
         }
